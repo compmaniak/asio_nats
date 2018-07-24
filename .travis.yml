@@ -1,0 +1,24 @@
+language: cpp
+dist: trusty
+sudo: required
+
+git:
+  depth: 1
+
+compiler:
+  - gcc
+  - clang
+
+services:
+  - docker
+
+install:
+  - sudo apt-get install -y libboost-system-dev
+  - docker run -d --name nats -p 4222:4222 -v "$(pwd)/test/gnatsd-test.conf:/gnatsd-test.conf" nats -c gnatsd-test.conf
+  - docker ps
+
+script:
+  - mkdir -p build && cd build && rm -rf *
+  - cmake .. -DCMAKE_BUILD_TYPE=Debug
+  - make VERBOSE=1
+  - ctest -V
