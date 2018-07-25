@@ -126,6 +126,21 @@ NATS_CLIENT_INLINE error::client_errors parse_error_msg(string_view sv)
     return error::protocol_error;
 }
 
+template<class T>
+NATS_CLIENT_INLINE bool from_chars(char const *data, size_t size, T& v)
+{
+#if BOOST_VERSION < 105600
+    try {
+        v = boost::lexical_cast<T>(data, size);
+        return true;
+    } catch (boost::bad_lexical_cast const&) {
+        return false;
+    }
+#else
+    return boost::conversion::try_lexical_convert(data, size, v);
+#endif
+}
+
 NATS_CLIENT_INLINE void parser::do_move(parser& oth) noexcept
 {
     if (&oth == this)
@@ -248,8 +263,7 @@ NATS_CLIENT_INLINE std::pair<input_any, size_t> parser::parse(const char *data, 
                     args_offs = last_i;
                 }
                 if (parse_args(args_view) && (args_count_ > 2)
-                    && boost::conversion::try_lexical_convert(
-                            &args_view[args_[args_count_ - 1].pos],
+                    && from_chars(&args_view[args_[args_count_ - 1].pos],
                             args_[args_count_ - 1].len,
                             payload_size_)) {
                     for (size_t i = 0; i < args_count_; ++i)

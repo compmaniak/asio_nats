@@ -5,10 +5,10 @@ project(asio-nats LANGUAGES CXX)
 add_subdirectory(asio_nats)
 
 set(CMAKE_CXX_FLAGS "-std=c++11 -Wall -Wextra $ENV{CXXFLAGS}")
-set(CMAKE_CXX_FLAGS_MINSIZEREL "${CMAKE_CXX_FLAGS} -Os")
-set(CMAKE_CXX_FLAGS_RELWITHDEBINFO "${CMAKE_CXX_FLAGS} -O2 -g")
+set(CMAKE_CXX_FLAGS_MINSIZEREL "-Os")
+set(CMAKE_CXX_FLAGS_RELWITHDEBINFO "-O2 -g")
 set(CMAKE_CXX_FLAGS_RELEASE "${CMAKE_CXX_FLAGS_RELWITHDEBINFO}")
-set(CMAKE_CXX_FLAGS_DEBUG "${CMAKE_CXX_FLAGS} -O0 -g")
+set(CMAKE_CXX_FLAGS_DEBUG "-O0 -g")
 
 add_executable(parser_test test/parser_test.cpp)
 target_link_libraries(parser_test PUBLIC asio_nats)

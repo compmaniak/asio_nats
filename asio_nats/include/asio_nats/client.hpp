@@ -440,8 +440,9 @@ public:
     template<class HeaderContainer, class BodyContainer>
     void read(basic_message<HeaderContainer, BodyContainer>& msg, boost::system::error_code& ec)
     {
+        using namespace detail;
         ec.assign(0, ec.category());
-        detail::assign_message(msg, {});
+        assign_message(msg, input_data<input_type::msg>());
         read_input(msg, ec);
     }
 
@@ -457,8 +458,9 @@ public:
     void read_for(basic_message<HeaderContainer, BodyContainer>& msg,  boost::posix_time::time_duration dur,
                   boost::system::error_code& ec)
     {
+        using namespace detail;
         ec.assign(0, ec.category());
-        detail::assign_message(msg, {});
+        assign_message(msg, input_data<input_type::msg>());
         read_input(msg, ec, dur);
     }
 
