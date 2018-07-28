@@ -7,7 +7,6 @@
 #include <boost/asio/deadline_timer.hpp>
 #include <boost/system/error_code.hpp>
 #include <boost/utility/string_ref.hpp>
-#include <boost/lexical_cast.hpp>
 #include <boost/optional/optional.hpp>
 #include <vector>
 #include <array>
@@ -220,15 +219,30 @@ constexpr size_t max_chars(size_t x, unsigned char base = 10)
     return x < base ? 1 : 1 + max_chars(x / base, base);
 }
 
+template<class T, class U>
+struct enable_if_unsigned_integer: std::enable_if<
+    std::numeric_limits<T>::is_integer
+    && !std::numeric_limits<T>::is_signed, U> {};
+
 template<class T>
-constexpr typename std::enable_if<std::numeric_limits<T>::is_integer, size_t>::type
+constexpr typename enable_if_unsigned_integer<T, size_t>::type
 max_chars(unsigned char base = 10)
 {
-    return max_chars(std::numeric_limits<T>::max(), base) + std::numeric_limits<T>::is_signed;
+    return max_chars(std::numeric_limits<T>::max(), base);
 }
 
-template<class T, unsigned char Base = 10>
-using char_array = std::array<char, max_chars<T>(Base) + 1>;
+template<class T>
+typename enable_if_unsigned_integer<T, size_t>::type
+write_dec(char *buf, T v)
+{
+    char *ptr = buf;
+    do {
+        *ptr++ = (v % 10) + '0';
+        v /= 10;
+    } while (v > 0);
+    std::reverse(buf, ptr);
+    return ptr - buf;
+}
 
 template<class Cancellable>
 void cancel_and_forward_error(Cancellable& obj, boost::system::error_code& ec)
@@ -545,12 +559,13 @@ public:
              boost::system::error_code& ec)
     {
         ec.assign(0, ec.category());
-        auto char_array = boost::lexical_cast<detail::char_array<size_t>>(boost::asio::buffer_size(payload));
+        char num_data[detail::max_chars<size_t>()];
+        auto num_size = detail::write_dec(num_data, boost::asio::buffer_size(payload));
         std::array<boost::asio::const_buffer, 9> buffers {{
             {"PUB ", 4},
             {subject.data(), subject.size()}, {" ", 1},
             {reply_to.data(), reply_to.size()}, {" ", 1},
-            detail::to_const_buffer(char_array.data()), {"\r\n", 2},
+            {num_data, num_size}, {"\r\n", 2},
             payload, {"\r\n", 2}
         }};
         do_write(buffers, ec);
@@ -614,11 +629,12 @@ public:
     void unsub(string_view sid, size_t max_msgs, boost::system::error_code& ec)
     {
         ec.assign(0, ec.category());
-        auto char_array = boost::lexical_cast<detail::char_array<size_t>>(max_msgs);
+        char num_data[detail::max_chars<size_t>()];
+        auto num_size = detail::write_dec(num_data, max_msgs);
         std::array<boost::asio::const_buffer, 5> buffers {{
             {"UNSUB ", 6},
             {sid.data(), sid.size()}, {" ", 1},
-            detail::to_const_buffer(char_array.data()), {"\r\n", 2}
+            {num_data, num_size}, {"\r\n", 2}
         }};
         do_write(buffers, ec);
     }

@@ -127,18 +127,24 @@ NATS_CLIENT_INLINE error::client_errors parse_error_msg(string_view sv)
 }
 
 template<class T>
-NATS_CLIENT_INLINE bool from_chars(char const *data, size_t size, T& v)
+NATS_CLIENT_INLINE typename enable_if_unsigned_integer<T, bool>::type
+parse_dec(const char *data, size_t size, T& v)
 {
-#if BOOST_VERSION < 105600
-    try {
-        v = boost::lexical_cast<T>(data, size);
-        return true;
-    } catch (boost::bad_lexical_cast const&) {
-        return false;
+    T tmp = 0;
+    for (size_t i = 0; i < size; ++i) {
+        char ch = data[i];
+        if (ch < '0' || ch > '9')
+            return false;
+        T d = ch - '0';
+        if (tmp > std::numeric_limits<T>::max() / 10)
+            return false;
+        tmp *= 10;
+        if (std::numeric_limits<T>::max() - tmp < d)
+            return false;
+        tmp += d;
     }
-#else
-    return boost::conversion::try_lexical_convert(data, size, v);
-#endif
+    v = tmp;
+    return true;
 }
 
 NATS_CLIENT_INLINE void parser::do_move(parser& oth) noexcept
@@ -263,7 +269,7 @@ NATS_CLIENT_INLINE std::pair<input_any, size_t> parser::parse(const char *data, 
                     args_offs = last_i;
                 }
                 if (parse_args(args_view) && (args_count_ > 2)
-                    && from_chars(&args_view[args_[args_count_ - 1].pos],
+                    && parse_dec(&args_view[args_[args_count_ - 1].pos],
                             args_[args_count_ - 1].len,
                             payload_size_)) {
                     for (size_t i = 0; i < args_count_; ++i)
