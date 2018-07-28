@@ -6,4 +6,9 @@ find_package(Boost REQUIRED COMPONENTS system)
 
 add_library(asio_nats INTERFACE)
 target_link_libraries(asio_nats INTERFACE ${Boost_SYSTEM_LIBRARY})
-target_include_directories(asio_nats INTERFACE "${CMAKE_CURRENT_LIST_DIR}/include")
+if (WIN32)
+    target_link_libraries(asio_nats INTERFACE ws2_32)
+endif()
+target_include_directories(asio_nats INTERFACE
+    "${Boost_INCLUDE_DIRS}"
+    "${CMAKE_CURRENT_LIST_DIR}/include")
