@@ -11,7 +11,7 @@ void test_no_messages(nats::client<Proto>& client, int sec = 2)
     client.read_for(msg, boost::posix_time::seconds{sec}, ec);
     auto const t2 = boost::posix_time::microsec_clock::universal_time();
     assert(ec == nats::error::timed_out);
-    assert((t2 - t1).seconds() >= 2);
+    assert((t2 - t1).seconds() >= sec);
     assert(msg.subject.empty());
     assert(msg.sid.empty());
     assert(msg.reply_to.empty());

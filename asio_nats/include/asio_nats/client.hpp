@@ -376,10 +376,14 @@ using message_void = basic_message<void, void>;
 using message_view = basic_message<string_view, string_view>;
 using message = basic_message<std::string, std::string>;
 
-template<class Protocol>
-class client
+template<class Impl>
+class basic_client;
+
+template<template<class> class Impl, class Protocol>
+class basic_client<Impl<Protocol>>
 {
-    using this_type = client<Protocol>;
+    using impl_type = Impl<Protocol>;
+    using this_type = basic_client<impl_type>;
     using endpoint_type = typename Protocol::endpoint;
 
     enum class state
@@ -391,9 +395,8 @@ class client
     };
 
 public:
-    client(boost::asio::io_service& io)
-        : socket_{io}
-        , timer_{io}
+    basic_client(boost::asio::io_service& io)
+        : timer_{io}
     {
         buffer_.resize(4 * 1024);
         verbose_ = false;
@@ -401,17 +404,23 @@ public:
         timer_wait_ = false;
     }
 
-    ~client()
+    ~basic_client()
     {
         reset();
     }
+
+    basic_client(this_type const&) = delete;
+    this_type& operator = (this_type const&) = delete;
+
+    basic_client(this_type&&) = delete;
+    this_type& operator = (this_type&&) = delete;
 
     bool verbose() const noexcept { return verbose_; }
     void verbose(bool v) noexcept { verbose_ = v; }
 
     bool connected() const noexcept
     {
-        return socket_.is_open() && state_ == state::ready;
+        return impl().socket().is_open() && state_ == state::ready;
     }
 
     void connect(endpoint_type const& ep)
@@ -435,7 +444,7 @@ public:
     {
         ec.assign(0, ec.category());
         auth_ = std::move(auth);
-        socket_.connect(ep, ec);
+        impl().socket().connect(ep, ec);
         if (!ec) {
             state_ = state::wait_info;
             message_void msg;
@@ -509,7 +518,7 @@ public:
             ec.assign(0, ec.category());
             std::vector<char> b = std::move(*batch_buffer_);
             batch_buffer_ = boost::none;
-            boost::asio::write(socket_, boost::asio::buffer(b), ec);
+            boost::asio::write(impl().stream(), boost::asio::buffer(b), ec);
         } else {
             ec = error::batch_not_ready;
         }
@@ -640,15 +649,18 @@ public:
     }
 
 private:
+    impl_type& impl() noexcept { return static_cast<impl_type&>(*this); }
+    impl_type const& impl() const noexcept { return static_cast<impl_type const&>(*this); }
+
     void reset(boost::system::error_code& ec)
     {
         data_offs_ = data_size_;
         pong_count_ = 0;
         state_ = state::disconnected;
-        if (socket_.is_open()) {
-            socket_.shutdown(Protocol::socket::shutdown_both, ec);
+        if (impl().socket().is_open()) {
+            impl().socket().shutdown(Protocol::socket::shutdown_both, ec);
             if (!ec)
-                socket_.close(ec);
+                impl().socket().close(ec);
         }
     }
 
@@ -694,7 +706,7 @@ private:
                 BOOST_ASSERT_MSG(false, "Unknown input type");
             }
         }
-        if (!stop_io_) socket_.async_read_some(boost::asio::buffer(buffer_),
+        if (!stop_io_) impl().stream().async_read_some(boost::asio::buffer(buffer_),
             [this, &msg, &ec](boost::system::error_code read_ec, size_t read_size) {
                 if (!read_ec) {
                     data_offs_ = 0;
@@ -724,15 +736,15 @@ private:
                     if (!wait_ec) {
                         stop_io_ = true;
                         boost::system::error_code next_ec;
-                        socket_.cancel(next_ec);
+                        impl().socket().cancel(next_ec);
                         ec = next_ec ? next_ec : error::timed_out;
                     }
                 });
                 timer_wait_ = true;
             }
             boost::system::error_code io_ec;
-            socket_.get_io_service().reset();
-            socket_.get_io_service().run(io_ec);
+            impl().socket().get_io_service().reset();
+            impl().socket().get_io_service().run(io_ec);
             if (io_ec && !ec)
                 ec = io_ec;
         }
@@ -749,7 +761,7 @@ private:
             return;
         }
         // TODO check info details
-        std::array<boost::asio::const_buffer, 10> buffers {{
+        std::array<boost::asio::const_buffer, 12> buffers {{
             detail::to_const_buffer("CONNECT {\"verbose\":"),
             detail::to_const_buffer(verbose_ ? "true" : "false"),
             detail::to_const_buffer(",\"user\":\""),
@@ -758,22 +770,23 @@ private:
             detail::to_const_buffer(auth_.password()),
             detail::to_const_buffer("\",\"auth_token\":\""),
             detail::to_const_buffer(auth_.token()),
-            detail::to_const_buffer("\",\"pedantic\":true,"
-                "\"tls_required\":false,"
+            detail::to_const_buffer("\",\"tls_required\":"),
+            detail::to_const_buffer(impl_type::secured() ? "true" : "false"),
+            detail::to_const_buffer(",\"pedantic\":true,"
                 "\"name\":\"asio_nats_client\","
                 "\"lang\":\"C++\","
                 "\"version\":\"\","
                 "\"protocol\":0}\r\n"),
             detail::to_const_buffer("PING\r\n")
         }};
-        boost::asio::async_write(socket_, buffers,
+        boost::asio::async_write(impl().stream(), buffers,
             [this, &ec](boost::system::error_code write_ec, size_t) {
                 if (!write_ec) {
                     pong_count_ += 1;
                     if (!verbose_) {
                         stop_io_ = true;
                         state_ = state::ready;
-                        detail::cancel_and_forward_error(socket_, ec);
+                        detail::cancel_and_forward_error(impl().socket(), ec);
                     } else {
                         state_ = state::wait_info_ack;
                     }
@@ -803,7 +816,7 @@ private:
             stop_io_ = true;
             return;
         }
-        boost::asio::async_write(socket_, boost::asio::buffer("PONG\r\n", 6),
+        boost::asio::async_write(impl().stream(), boost::asio::buffer("PONG\r\n", 6),
             [&ec](boost::system::error_code write_ec, size_t) {
                 if (write_ec && write_ec != boost::asio::error::operation_aborted && !ec)
                     ec = write_ec;
@@ -850,11 +863,10 @@ private:
             boost::asio::mutable_buffer b{batch_buffer_->data() + old_size, add_size};
             boost::asio::buffer_copy(b, buffers);
         } else {
-            boost::asio::write(socket_, buffers, ec);
+            boost::asio::write(impl().stream(), buffers, ec);
         }
     }
 
-    typename Protocol::socket socket_;
     boost::asio::deadline_timer timer_;
     detail::parser parser_;
     std::vector<char> buffer_;
@@ -867,6 +879,30 @@ private:
     bool verbose_:1;
     bool stop_io_:1;
     bool timer_wait_:1;
+};
+
+template<class Protocol>
+class client: public basic_client<client<Protocol>>
+{
+    using this_type = client<Protocol>;
+    using socket_type = typename Protocol::socket;
+
+    friend basic_client<this_type>;
+
+public:
+    client(boost::asio::io_service& io)
+        : basic_client<this_type>{io}
+        , socket_{io}
+    {}
+
+private:
+    static bool secured() noexcept { return false; }
+    socket_type& socket() noexcept { return socket_; }
+    socket_type& stream() noexcept { return socket_; }
+    socket_type const& socket() const noexcept { return socket_; }
+    socket_type const& stream() const noexcept { return socket_; }
+
+    socket_type socket_;
 };
 
 } // namespace nats
