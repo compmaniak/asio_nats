@@ -1,9 +1,10 @@
 #include <boost/asio/ip/tcp.hpp>
 #include <asio_nats/client.hpp>
+#include <asio_nats/secured_client.hpp>
 #include <cassert>
 
-template<class Proto>
-void test_no_messages(nats::client<Proto>& client, int sec = 2)
+template<class Impl>
+void test_no_messages(nats::basic_client<Impl>& client, int sec = 2)
 {
     nats::message_view msg;
     boost::system::error_code ec;
@@ -18,8 +19,8 @@ void test_no_messages(nats::client<Proto>& client, int sec = 2)
     assert(msg.payload.empty());
 }
 
-template<class Proto>
-void test_io(nats::client<Proto>& client)
+template<class Impl>
+void test_io(nats::basic_client<Impl>& client)
 {
     boost::system::error_code ec;
 
@@ -127,18 +128,14 @@ void test_io(nats::client<Proto>& client)
     test_no_messages(client);
 }
 
-int main()
+template<class Impl>
+void test_client(nats::basic_client<Impl>& client,
+                 typename nats::basic_client<Impl>::endpoint_type endpoint)
 {
-    using proto = boost::asio::ip::tcp;
-
-    proto::endpoint const endpoint{boost::asio::ip::address_v4::loopback(), 4222};
-
-    boost::asio::io_service io;
     boost::system::error_code ec;
     nats::message_void msg;
 
     // test default state
-    nats::client<proto> client{io};
     assert(!client.connected());
     assert(!client.verbose());
 
@@ -190,4 +187,14 @@ int main()
 
     client.connect(endpoint, {"test_user", "test_password"});
     test_io(client);
+}
+
+int main()
+{
+    boost::asio::io_service io;
+    namespace ip = boost::asio::ip;
+    nats::client<ip::tcp> client{io};
+    test_client(client, {ip::address_v4::loopback(), 42221});
+    nats::secured_client<ip::tcp> secured_client{io};
+    test_client(secured_client, {ip::address_v4::loopback(), 42222});
 }

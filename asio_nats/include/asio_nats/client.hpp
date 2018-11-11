@@ -384,7 +384,6 @@ class basic_client<Impl<Protocol>>
 {
     using impl_type = Impl<Protocol>;
     using this_type = basic_client<impl_type>;
-    using endpoint_type = typename Protocol::endpoint;
 
     enum class state
     {
@@ -395,18 +394,14 @@ class basic_client<Impl<Protocol>>
     };
 
 public:
+    using endpoint_type = typename Protocol::endpoint;
+
     basic_client(boost::asio::io_service& io)
         : timer_{io}
     {
         buffer_.resize(4 * 1024);
         verbose_ = false;
-        stop_io_ = false;
         timer_wait_ = false;
-    }
-
-    ~basic_client()
-    {
-        reset();
     }
 
     basic_client(this_type const&) = delete;
@@ -443,12 +438,19 @@ public:
     void connect(endpoint_type const& ep, authorization auth, boost::system::error_code& ec)
     {
         ec.assign(0, ec.category());
-        auth_ = std::move(auth);
         impl().socket().connect(ep, ec);
-        if (!ec) {
-            state_ = state::wait_info;
-            message_void msg;
-            read_input(msg, ec);
+        if (ec) return;
+        state_ = state::wait_info;
+        message_void msg;
+        read_input(impl().socket(), msg, ec);
+        if (ec) return;
+        do_handshake(auth, ec);
+        if (ec) return;
+        if (!verbose_) {
+            state_ = state::ready;
+        } else {
+            state_ = state::wait_info_ack;
+            read_input(impl().stream(), msg, ec);
         }
     }
 
@@ -466,7 +468,7 @@ public:
         using namespace detail;
         ec.assign(0, ec.category());
         assign_message(msg, input_data<input_type::msg>());
-        read_input(msg, ec);
+        read_input(impl().stream(), msg, ec);
     }
 
     template<class HeaderContainer, class BodyContainer>
@@ -484,7 +486,7 @@ public:
         using namespace detail;
         ec.assign(0, ec.category());
         assign_message(msg, input_data<input_type::msg>());
-        read_input(msg, ec, dur);
+        read_input(impl().stream(), msg, ec, dur);
     }
 
     void close()
@@ -496,8 +498,11 @@ public:
 
     void close(boost::system::error_code& ec)
     {
+        data_offs_ = data_size_;
+        pong_count_ = 0;
+        state_ = state::disconnected;
         ec.assign(0, ec.category());
-        reset(ec);
+        impl().close(ec);
     }
 
     void batch_begin()
@@ -652,42 +657,31 @@ private:
     impl_type& impl() noexcept { return static_cast<impl_type&>(*this); }
     impl_type const& impl() const noexcept { return static_cast<impl_type const&>(*this); }
 
-    void reset(boost::system::error_code& ec)
+    template<class Stream,
+             class HeaderContainer,
+             class BodyContainer>
+    bool read_from_buffer(Stream& stream,
+                          basic_message<HeaderContainer, BodyContainer>& msg,
+                          boost::system::error_code& ec)
     {
-        data_offs_ = data_size_;
-        pong_count_ = 0;
-        state_ = state::disconnected;
-        if (impl().socket().is_open()) {
-            impl().socket().shutdown(Protocol::socket::shutdown_both, ec);
-            if (!ec)
-                impl().socket().close(ec);
-        }
-    }
-
-    void reset()
-    {
-        boost::system::error_code ec;
-        reset(ec);
-    }
-
-    template<class HeaderContainer, class BodyContainer>
-    void read_from_buffer(basic_message<HeaderContainer, BodyContainer>& msg, boost::system::error_code& ec)
-    {
-        while (!stop_io_ && data_offs_ < data_size_) {
+        bool stop = false;
+        while (!stop && data_offs_ < data_size_) {
             auto pr = parser_.parse(&buffer_[data_offs_], data_size_ - data_offs_);
             data_offs_ += pr.second;
             switch (pr.first.type()) {
             case detail::input_type::unknown:
                 ec = error::parser_error;
-                stop_io_ = true;
+                stop = true;
                 break;
             case detail::input_type::need_more:
                 break;
             case detail::input_type::info:
                 handle_input(ec, pr.first.template data<detail::input_type::info>());
+                stop = true;
                 break;
             case detail::input_type::msg:
                 handle_input(ec, pr.first.template data<detail::input_type::msg>(), msg);
+                stop = true;
                 break;
             case detail::input_type::ping:
                 handle_input(ec, pr.first.template data<detail::input_type::ping>());
@@ -696,22 +690,28 @@ private:
                 handle_input(ec, pr.first.template data<detail::input_type::pong>());
                 break;
             case detail::input_type::ok:
-                handle_input(ec, pr.first.template data<detail::input_type::ok>());
+                if (state_ == state::wait_info_ack) {
+                    state_ = state::ready;
+                    stop = true;
+                } else if (!verbose_) {
+                    ec = error::unexpected_response;
+                }
                 break;
             case detail::input_type::err:
                 ec = pr.first.template data<detail::input_type::err>().code;
-                stop_io_ = true;
+                stop = true;
                 break;
             default:
                 BOOST_ASSERT_MSG(false, "Unknown input type");
             }
+            stop = stop || ec;
         }
-        if (!stop_io_) impl().stream().async_read_some(boost::asio::buffer(buffer_),
-            [this, &msg, &ec](boost::system::error_code read_ec, size_t read_size) {
+        if (!stop) stream.async_read_some(boost::asio::buffer(buffer_),
+            [this, &stream, &msg, &ec](boost::system::error_code read_ec, size_t read_size) {
                 if (!read_ec) {
                     data_offs_ = 0;
                     data_size_ = read_size;
-                    read_from_buffer(msg, ec);
+                    read_from_buffer(stream, msg, ec);
                 } else if (read_ec != boost::asio::error::operation_aborted && !ec) {
                     ec = read_ec;
                 }
@@ -720,36 +720,67 @@ private:
             timer_wait_ = false;
             detail::cancel_and_forward_error(timer_, ec);
         }
+        return stop;
     }
 
-    template<class HeaderContainer, class BodyContainer>
-    void read_input(basic_message<HeaderContainer, BodyContainer>& msg, boost::system::error_code& ec,
+    template<class Stream,
+             class HeaderContainer,
+             class BodyContainer>
+    void read_input(Stream& stream,
+                    basic_message<HeaderContainer, BodyContainer>& msg,
+                    boost::system::error_code& ec,
                     boost::posix_time::time_duration dur = boost::posix_time::not_a_date_time)
     {
-        stop_io_ = false;
         timer_wait_ = false;
-        read_from_buffer(msg, ec);
-        if (!stop_io_) {
+        if (!read_from_buffer(stream, msg, ec)) {
             if (!dur.is_not_a_date_time()) {
                 timer_.expires_from_now(dur);
                 timer_.async_wait([this, &ec](boost::system::error_code wait_ec) {
-                    if (!wait_ec) {
-                        stop_io_ = true;
-                        boost::system::error_code next_ec;
-                        impl().socket().cancel(next_ec);
-                        ec = next_ec ? next_ec : error::timed_out;
+                    if (wait_ec != boost::asio::error::operation_aborted) {
+                        if (!(ec = wait_ec))
+                            ec = error::timed_out;
+                        detail::cancel_and_forward_error(impl().socket(), ec);
                     }
                 });
                 timer_wait_ = true;
             }
             boost::system::error_code io_ec;
-            impl().socket().get_io_service().reset();
-            impl().socket().get_io_service().run(io_ec);
+            stream.get_io_service().reset();
+            stream.get_io_service().run(io_ec);
             if (io_ec && !ec)
                 ec = io_ec;
         }
-        if (ec && (&ec.category() != &error::client_errors_category() || ec.value() < error::invalid_subject))
-            reset();
+        if (ec && (&ec.category() != &error::client_errors_category() || ec.value() < error::invalid_subject)) {
+            boost::system::error_code ec;
+            close(ec);
+        }
+    }
+
+    void do_handshake(authorization const& auth, boost::system::error_code& ec)
+    {
+        impl().handshake(ec);
+        if (!ec) {
+            std::array<boost::asio::const_buffer, 12> buffers {{
+                detail::to_const_buffer("CONNECT {\"verbose\":"),
+                detail::to_const_buffer(verbose_ ? "true" : "false"),
+                detail::to_const_buffer(",\"user\":\""),
+                detail::to_const_buffer(auth.user()),
+                detail::to_const_buffer("\",\"pass\":\""),
+                detail::to_const_buffer(auth.password()),
+                detail::to_const_buffer("\",\"auth_token\":\""),
+                detail::to_const_buffer(auth.token()),
+                detail::to_const_buffer("\",\"tls_required\":"),
+                detail::to_const_buffer(impl().secured() ? "true" : "false"),
+                detail::to_const_buffer(",\"pedantic\":true,"
+                    "\"name\":\"asio_nats_client\","
+                    "\"lang\":\"C++\","
+                    "\"version\":\"\","
+                    "\"protocol\":0}\r\n"),
+                detail::to_const_buffer("PING\r\n")
+            }};
+            do_write(buffers, ec);
+            pong_count_ += 1;
+        }
     }
 
     void handle_input(boost::system::error_code& ec,
@@ -757,43 +788,9 @@ private:
     {
         if (state_ != state::wait_info) {
             ec = error::unexpected_response;
-            stop_io_ = true;
             return;
         }
         // TODO check info details
-        std::array<boost::asio::const_buffer, 12> buffers {{
-            detail::to_const_buffer("CONNECT {\"verbose\":"),
-            detail::to_const_buffer(verbose_ ? "true" : "false"),
-            detail::to_const_buffer(",\"user\":\""),
-            detail::to_const_buffer(auth_.user()),
-            detail::to_const_buffer("\",\"pass\":\""),
-            detail::to_const_buffer(auth_.password()),
-            detail::to_const_buffer("\",\"auth_token\":\""),
-            detail::to_const_buffer(auth_.token()),
-            detail::to_const_buffer("\",\"tls_required\":"),
-            detail::to_const_buffer(impl_type::secured() ? "true" : "false"),
-            detail::to_const_buffer(",\"pedantic\":true,"
-                "\"name\":\"asio_nats_client\","
-                "\"lang\":\"C++\","
-                "\"version\":\"\","
-                "\"protocol\":0}\r\n"),
-            detail::to_const_buffer("PING\r\n")
-        }};
-        boost::asio::async_write(impl().stream(), buffers,
-            [this, &ec](boost::system::error_code write_ec, size_t) {
-                if (!write_ec) {
-                    pong_count_ += 1;
-                    if (!verbose_) {
-                        stop_io_ = true;
-                        state_ = state::ready;
-                        detail::cancel_and_forward_error(impl().socket(), ec);
-                    } else {
-                        state_ = state::wait_info_ack;
-                    }
-                } else if (write_ec != boost::asio::error::operation_aborted && !ec) {
-                    ec = write_ec;
-                }
-            });
     }
 
     template<class HeaderContainer, class BodyContainer>
@@ -801,11 +798,11 @@ private:
                       detail::input_data<detail::input_type::msg> msg,
                       basic_message<HeaderContainer, BodyContainer>& to_msg)
     {
-        if (state_ == state::ready)
-            detail::assign_message(to_msg, msg);
-        else
+        if (state_ != state::ready) {
             ec = error::unexpected_response;
-        stop_io_ = true;
+            return;
+        }
+        detail::assign_message(to_msg, msg);
     }
 
     void handle_input(boost::system::error_code& ec,
@@ -813,10 +810,11 @@ private:
     {
         if (state_ != state::ready) {
             ec = error::unexpected_response;
-            stop_io_ = true;
             return;
         }
-        boost::asio::async_write(impl().stream(), boost::asio::buffer("PONG\r\n", 6),
+        boost::asio::async_write(
+            impl().stream(),
+            boost::asio::buffer("PONG\r\n", 6),
             [&ec](boost::system::error_code write_ec, size_t) {
                 if (write_ec && write_ec != boost::asio::error::operation_aborted && !ec)
                     ec = write_ec;
@@ -828,29 +826,9 @@ private:
     {
         if (pong_count_ == 0) {
             ec = error::unexpected_response;
-            stop_io_ = true;
             return;
         }
         pong_count_ -= 1;
-    }
-
-    void handle_input(boost::system::error_code& ec,
-                      detail::input_data<detail::input_type::ok>)
-    {
-        switch (state_) {
-        case state::ready:
-            if (verbose_)
-                return;
-            ec = error::unexpected_response;
-            break;
-        case state::wait_info_ack:
-            state_ = state::ready;
-            break;
-        default:
-            ec = error::unexpected_response;
-            break;
-        }
-        stop_io_ = true;
     }
 
     template<class ConstBufferSequence>
@@ -875,9 +853,7 @@ private:
     size_t data_offs_ = 0;
     size_t pong_count_ = 0;
     state state_ = state::disconnected;
-    authorization auth_;
     bool verbose_:1;
-    bool stop_io_:1;
     bool timer_wait_:1;
 };
 
@@ -890,17 +866,24 @@ class client: public basic_client<client<Protocol>>
     friend basic_client<this_type>;
 
 public:
-    client(boost::asio::io_service& io)
+    explicit client(boost::asio::io_service& io)
         : basic_client<this_type>{io}
         , socket_{io}
     {}
 
 private:
-    static bool secured() noexcept { return false; }
+    bool secured() const noexcept { return false; }
     socket_type& socket() noexcept { return socket_; }
     socket_type& stream() noexcept { return socket_; }
     socket_type const& socket() const noexcept { return socket_; }
     socket_type const& stream() const noexcept { return socket_; }
+
+    void handshake(boost::system::error_code&) const noexcept {}
+
+    void close(boost::system::error_code& ec)
+    {
+        socket_.close(ec);
+    }
 
     socket_type socket_;
 };
